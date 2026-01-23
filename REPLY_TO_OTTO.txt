@@ -1,0 +1,23 @@
+==================================================================================
+REPLY TO OTTO - COPY AND PASTE THIS
+==================================================================================
+
+Yes, that's perfect! The guidelines you've structured are exactly what I need:
+
+1. ✅ Condition: "User asks about product features" 
+   Action: Provide clear, accurate information about available features and benefits
+   Priority: MEDIUM
+
+2. ✅ Condition: "User reports a technical issue"
+   Action: Gather details about the issue and provide basic troubleshooting steps  
+   Priority: HIGH
+
+3. ✅ Condition: "User expresses frustration"
+   Action: Acknowledge their concern empathetically and offer to escalate to human support
+   Priority: HIGH
+
+All the guidelines now have proper condition fields and are correctly formatted. 
+
+Please proceed with creating the TestBot now. Everything is ready!
+
+==================================================================================
