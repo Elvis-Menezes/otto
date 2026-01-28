@@ -15,8 +15,12 @@ Otto acts as an intelligent bot creation assistant that:
 
 ### Prerequisites
 
+**Required:**
 - Python 3.12+
 - OpenAI API key
+
+**Optional:**
+- MongoDB Atlas account (for persistent storage)
 - Virtual environment (recommended)
 
 ### Installation
@@ -58,6 +62,123 @@ Otto acts as an intelligent bot creation assistant that:
    ```
 
 The server will start on `http://localhost:8800`
+
+## 💾 Data Persistence
+
+By default, Otto uses **in-memory storage** - bots are stored in RAM and lost when the server restarts. To enable **persistent storage**, configure MongoDB.
+
+### Option 1: In-Memory Storage (Default)
+
+**Pros:**
+- ✅ No setup required
+- ✅ Fast (instant access)
+- ✅ Good for development/testing
+
+**Cons:**
+- ❌ Bots lost on server restart
+- ❌ No data recovery
+
+**Usage:** Just run `python server.py` without MongoDB configuration.
+
+### Option 2: MongoDB Persistent Storage (Recommended)
+
+**Pros:**
+- ✅ Bots survive server restarts
+- ✅ Data recovery possible
+- ✅ Production-ready
+- ✅ Free tier available (MongoDB Atlas)
+
+**Cons:**
+- Requires MongoDB setup (~5 minutes)
+- Slightly slower (~10-50ms network latency)
+
+### MongoDB Atlas Setup (Free Tier)
+
+1. **Create MongoDB Atlas account**
+   - Go to [mongodb.com/cloud/atlas](https://www.mongodb.com/cloud/atlas)
+   - Sign up for free account
+   - No credit card required
+
+2. **Create a free cluster**
+   - Click "Build a Database"
+   - Select "M0 Free" tier
+   - Choose a cloud provider and region (closest to you)
+   - Click "Create"
+
+3. **Create database user**
+   - Go to "Database Access" in left sidebar
+   - Click "Add New Database User"
+   - Choose "Password" authentication
+   - Create username and strong password
+   - Set role to "Read and write to any database"
+   - Click "Add User"
+
+4. **Whitelist IP addresses**
+   - Go to "Network Access" in left sidebar
+   - Click "Add IP Address"
+   - For testing: Click "Allow Access from Anywhere" (0.0.0.0/0)
+   - For production: Add your server's specific IP
+   - Click "Confirm"
+
+5. **Get connection string**
+   - Go to "Database" in left sidebar
+   - Click "Connect" on your cluster
+   - Choose "Connect your application"
+   - Select "Python" driver and version 3.12+
+   - Copy the connection string (looks like: `mongodb+srv://username:password@cluster.mongodb.net/`)
+   - Replace `<password>` with your actual password
+
+6. **Configure Otto**
+   - Edit your `.env` file:
+     ```bash
+     MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/
+     ```
+   - Restart the server:
+     ```bash
+     python server.py
+     ```
+
+7. **Verify connection**
+   - Look for startup message: `✅ MongoDB connection successful`
+   - Create a test bot via Otto
+   - Restart server and verify bot still exists
+
+### Storage Comparison
+
+| Aspect | In-Memory | MongoDB Atlas |
+|--------|-----------|---------------|
+| **Setup Time** | 0 minutes | 5 minutes |
+| **Cost** | Free | Free (M0 tier) |
+| **Persistence** | ❌ Lost on restart | ✅ Survives restarts |
+| **Speed** | Instant | ~10-50ms per operation |
+| **Data Recovery** | ❌ Impossible | ✅ Backup available |
+| **Use Case** | Development | Production |
+
+### Data Stored in MongoDB
+
+When MongoDB is enabled, these collections are created:
+
+| Collection | Contains | Example |
+|-----------|----------|---------|
+| `agents` | All created bots | Otto, TestBot, Reva |
+| `guidelines` | Bot behavior rules | "When user asks X, do Y" |
+| `journeys` | Conversation flows | Order tracking, refunds |
+| `tags` | Organization metadata | Agent tags |
+| `relationships` | Entity connections | Guideline → Agent links |
+| `sessions` | Chat conversations | Customer interactions |
+| `customers` | User profiles | Customer data |
+
+### Switching Storage Modes
+
+**From In-Memory to MongoDB:**
+1. Add `MONGODB_URI` to `.env`
+2. Restart server
+3. Previous in-memory bots are lost (create new ones)
+
+**From MongoDB to In-Memory:**
+1. Remove or comment out `MONGODB_URI` in `.env`
+2. Restart server
+3. MongoDB data remains intact (just not loaded)
 
 ## 🎮 Usage
 
@@ -287,6 +408,65 @@ cat .env | grep OPENAI_API_KEY
 # Reinstall dependencies
 pip install -r requirements.txt
 ```
+
+### MongoDB Connection Failed
+
+**Symptom:** `❌ MongoDB connection failed: ...`
+
+**Solutions:**
+1. **Check connection string format**
+   ```bash
+   # Should look like one of these:
+   mongodb+srv://username:password@cluster.mongodb.net/
+   mongodb://localhost:27017/
+   ```
+
+2. **Verify credentials**
+   - Username and password are correct
+   - Password doesn't contain special characters (or URL-encode them)
+   - Database user has "Read and write" permissions
+
+3. **Check network access**
+   - IP address is whitelisted in MongoDB Atlas
+   - Or "Allow Access from Anywhere" is enabled (0.0.0.0/0)
+
+4. **Test connection manually**
+   ```bash
+   # Install mongosh (MongoDB shell)
+   pip install pymongo
+   python -c "from pymongo import MongoClient; MongoClient('YOUR_URI').admin.command('ping'); print('Connected!')"
+   ```
+
+5. **Fallback to in-memory**
+   - Server automatically falls back if MongoDB fails
+   - Remove `MONGODB_URI` to disable MongoDB completely
+
+### Bots Disappeared After Restart
+
+**Symptom:** Bots existed before restart, now gone
+
+**Cause:** In-memory storage mode (no MongoDB configured)
+
+**Solution:**
+1. Set up MongoDB Atlas (see Data Persistence section)
+2. Add `MONGODB_URI` to `.env`
+3. Restart server
+4. Recreate bots (they'll now persist)
+
+### Slow Bot Creation
+
+**Symptom:** Creating bots takes 10-20 seconds
+
+**Cause:** Network latency to MongoDB Atlas
+
+**Solutions:**
+- Use MongoDB cluster in region closest to you
+- Accept the latency (one-time cost per bot creation)
+- Switch to local MongoDB for faster access:
+  ```bash
+  # Install MongoDB locally
+  # Then use: MONGODB_URI=mongodb://localhost:27017/
+  ```
 
 ### API Connection Failed
 - Ensure Parlant server is running on the configured URL

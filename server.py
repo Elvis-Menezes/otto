@@ -7,11 +7,19 @@ import httpx
 import parlant.sdk as p
 from dotenv import load_dotenv
 
+# Import domain persistence layer (event-based, not Parlant internals)
+from domain_persistence import initialize_persistence, get_persistence, shutdown_persistence
+from domain_rehydration import rehydrate_bots_from_persistence, persist_bot_creation
+
 load_dotenv()
 
 # Server configuration
 PARLANT_API_BASE_URL = os.getenv("PARLANT_API_BASE_URL", "http://localhost:8800")
 PARLANT_API_TIMEOUT = int(os.getenv("PARLANT_API_TIMEOUT", "30"))
+PARLANT_API_TOKEN = os.getenv("PARLANT_API_TOKEN")  # Optional bearer token
+
+# MongoDB configuration (for domain persistence, NOT Parlant internal storage)
+MONGODB_URI = os.getenv("MONGODB_URI", None)
 
 REQUIRED_SPEC_FIELDS = {
     "name",
@@ -160,23 +168,19 @@ async def _call_parlant_api(
         Tuple of (success: bool, response_data: dict)
     """
     url = f"{PARLANT_API_BASE_URL}{endpoint}"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if PARLANT_API_TOKEN:
+        headers["Authorization"] = f"Bearer {PARLANT_API_TOKEN}"
     
     try:
         async with httpx.AsyncClient(timeout=PARLANT_API_TIMEOUT) as client:
             if method.upper() == "POST":
-                response = await client.post(
-                    url,
-                    json=data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                    },
-                )
+                response = await client.post(url, json=data, headers=headers)
             elif method.upper() == "GET":
-                response = await client.get(
-                    url,
-                    headers={"Accept": "application/json"},
-                )
+                response = await client.get(url, headers=headers)
             else:
                 return False, {"error": f"Unsupported HTTP method: {method}"}
             
@@ -209,9 +213,9 @@ def _map_criticality_to_api(criticality: str | None) -> str:
 def _map_composition_mode_to_api(mode: str | None) -> str:
     """Map composition mode to API format."""
     if mode == "COMPOSITED":
-        return "canned_composited"
+        return "composited_canned"
     elif mode == "STRICT":
-        return "canned_strict"
+        return "strict_canned"
     else:
         return "fluid"
 
@@ -264,15 +268,7 @@ async def create_parlant_bot(
 ) -> p.ToolResult:
     """
     Create a fully configured Parlant bot via REST API from a validated specification.
-    
-    This tool:
-    1. Validates the bot specification against required schema
-    2. Creates the agent via POST /agents
-    3. Creates guidelines via POST /guidelines for each guideline
-    4. Creates journeys via POST /journeys for each journey
-    5. Returns the created bot details
     """
-    # Parse and validate spec
     try:
         spec = json.loads(spec_json)
     except json.JSONDecodeError as exc:
@@ -303,8 +299,9 @@ async def create_parlant_bot(
     
     agent_id = agent_response.get("id")
     agent_name = agent_response.get("name")
-    
-    # Step 2: Create guidelines via REST API
+    agent_tag = f"agent:{agent_id}"
+
+    # Step 2: Create guidelines via REST API (tagged to agent)
     created_guidelines = []
     for idx, guideline in enumerate(spec["guidelines"], 1):
         guideline_payload = {
@@ -312,6 +309,7 @@ async def create_parlant_bot(
             "action": guideline.get("action"),
             "description": guideline.get("description"),
             "criticality": _map_criticality_to_api(guideline.get("criticality")),
+            "tags": [agent_tag],
         }
         
         success, guideline_response = await _call_parlant_api("POST", "/guidelines", guideline_payload)
@@ -321,30 +319,65 @@ async def create_parlant_bot(
                 "condition": guideline["condition"]
             })
         else:
-            # Log but continue with other guidelines
             created_guidelines.append({
                 "error": f"Guideline {idx} failed: {guideline_response.get('error')}"
             })
     
-    # Step 3: Create journeys via REST API
+    # Step 3: Create journeys via REST API (tagged to agent)
     created_journeys = []
     for idx, journey in enumerate(spec["journeys"], 1):
         journey_payload = {
             "title": journey["title"],
             "description": journey["description"],
             "conditions": journey["conditions"],
+            "tags": [agent_tag],
         }
         
         success, journey_response = await _call_parlant_api("POST", "/journeys", journey_payload)
         if success:
             created_journeys.append({
                 "id": journey_response.get("id"),
-                "title": journey["title"]
+                "title": journey["title"],
+                "description": journey["description"],
+                "conditions": journey["conditions"],
             })
         else:
             created_journeys.append({
                 "error": f"Journey {idx} failed: {journey_response.get('error')}"
             })
+    
+    # Step 4: Persist to MongoDB (event-based mirroring)
+    try:
+        persistence = get_persistence()
+        if persistence.enabled:
+            guidelines_for_persistence = []
+            for idx, guideline in enumerate(spec["guidelines"]):
+                if idx < len(created_guidelines) and "id" in created_guidelines[idx]:
+                    guidelines_for_persistence.append({
+                        "id": created_guidelines[idx]["id"],
+                        "condition": guideline["condition"],
+                        "action": guideline.get("action"),
+                        "description": guideline.get("description"),
+                        "criticality": _map_criticality_to_api(guideline.get("criticality")),
+                    })
+            
+            persisted = await persist_bot_creation(
+                persistence=persistence,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_description=_build_agent_description(spec),
+                composition_mode=_map_composition_mode_to_api(spec.get("composition_mode")),
+                max_engine_iterations=spec.get("max_engine_iterations", 3),
+                guidelines=guidelines_for_persistence,
+                journeys=created_journeys,
+            )
+            
+            if persisted:
+                print(f"💾 Persisted bot '{agent_name}' to MongoDB (ID: {agent_id})")
+            else:
+                print("⚠️  Bot created in Parlant but MongoDB persistence failed")
+    except Exception as e:
+        print(f"⚠️  MongoDB persistence error: {e}")
     
     return p.ToolResult(
         {
@@ -356,96 +389,106 @@ async def create_parlant_bot(
             "guidelines": created_guidelines,
             "journeys": created_journeys,
             "api_base_url": PARLANT_API_BASE_URL,
+            "persisted_to_mongodb": persistence.enabled if 'persistence' in locals() else False,
         }
     )
 
 
 async def main():
-    """
-    Initialize and run the Parlant server with Otto orchestrator agent.
-    
-    Otto is configured to:
-    - Gather bot requirements from business users
-    - Ask clarifying questions for missing details
-    - Validate complete specifications
-    - Create bots via REST API calls to Parlant server
-    """
     print("🚀 Starting Otto Bot Creator Server...")
     print(f"📡 Parlant API: {PARLANT_API_BASE_URL}")
     print(f"⏱️  API Timeout: {PARLANT_API_TIMEOUT}s")
+    
+    print("💾 Initializing domain persistence...")
+    persistence_enabled, persistence_message = await initialize_persistence(MONGODB_URI)
+    
+    if persistence_enabled:
+        print(f"✅ {persistence_message}")
+        print("💾 Domain events will persist to MongoDB")
+        print("🔄 Bots will be rehydrated on startup")
+    else:
+        print(f"⚠️  {persistence_message}")
+        print("💾 Using in-memory only (no persistence)")
+        print("💡 Set MONGODB_URI in .env to enable persistence")
+    
+    print("-" * 50)
+    print("🏗️  Parlant: Using TransientDocumentDatabase (in-memory)")
+    print("📦 Persistence: Event-based MongoDB mirroring (domain layer)")
     print("-" * 50)
     
-    async with p.Server(nlp_service=p.NLPServices.openai) as server:
-        # Create Otto orchestrator agent
-        agent = await server.create_agent(
-            name="Otto",
-            description=(
-                "Primary orchestrator for converting a business chatbot description into a fully "
-                "configured Parlant bot. Collect requirements, detect gaps, ask focused follow-ups, "
-                "produce a validated specification, and create the bot using Parlant REST APIs."
-            ),
-        )
-        
-        print(f"✅ Created Otto agent (ID: {agent.id})")
+    try:
+        async with p.Server(nlp_service=p.NLPServices.openai) as server:
+            agent = await server.create_agent(
+                name="Otto",
+                description=(
+                    "Primary orchestrator for converting a business chatbot description into a fully "
+                    "configured Parlant bot. Collect requirements, detect gaps, ask focused follow-ups, "
+                    "produce a validated specification, and create the bot using Parlant REST APIs."
+                ),
+            )
+            
+            print(f"✅ Created Otto agent (ID: {agent.id})")
 
-        # Guideline 1: Initial requirement extraction
-        await agent.create_guideline(
-            condition="When a business user provides a bot description or asks to create a bot.",
-            action=(
-                "Extract purpose, scope, target users, use cases, tone/personality, required tools, "
-                "constraints, and guardrails. Summarize extracted fields clearly before proceeding."
-            ),
-            description="Ensure requirements are captured explicitly from the start.",
-            criticality=p.Criticality.HIGH,
-        )
+            await agent.create_guideline(
+                condition="When a business user provides a bot description or asks to create a bot.",
+                action=(
+                    "Extract purpose, scope, target users, use cases, tone/personality, required tools, "
+                    "constraints, and guardrails. Summarize extracted fields clearly before proceeding."
+                ),
+                description="Ensure requirements are captured explicitly from the start.",
+                criticality=p.Criticality.HIGH,
+            )
 
-        # Guideline 2: Gap detection and clarification
-        await agent.create_guideline(
-            condition="When any required parameter is missing, vague, or ambiguous.",
-            action=(
-                "Ask ONE focused clarification question at a time and explain why that detail matters. "
-                "Guide the user step-by-step until all parameters are explicit and clear."
-            ),
-            description="Prevent assumptions and drive completion through structured questioning.",
-            criticality=p.Criticality.HIGH,
-        )
+            await agent.create_guideline(
+                condition="When any required parameter is missing, vague, or ambiguous.",
+                action=(
+                    "Ask ONE focused clarification question at a time and explain why that detail matters. "
+                    "Guide the user step-by-step until all parameters are explicit and clear."
+                ),
+                description="Prevent assumptions and drive completion through structured questioning.",
+                criticality=p.Criticality.HIGH,
+            )
 
-        # Guideline 3: Specification building
-        await agent.create_guideline(
-            condition="When preparing to build a bot specification from gathered requirements.",
-            action=(
-                "Construct detailed Parlant guidelines and journeys that teach effective bot design, "
-                "enforce consistency, and apply safety/guardrails based on the user's requirements."
-            ),
-            description="Generate guidance and journeys from finalized requirements.",
-            criticality=p.Criticality.MEDIUM,
-        )
+            await agent.create_guideline(
+                condition="When preparing to build a bot specification from gathered requirements.",
+                action=(
+                    "Construct detailed Parlant guidelines and journeys that teach effective bot design, "
+                    "enforce consistency, and apply safety/guardrails based on the user's requirements."
+                ),
+                description="Generate guidance and journeys from finalized requirements.",
+                criticality=p.Criticality.MEDIUM,
+            )
 
-        # Guideline 4: Bot creation via REST API
-        await agent.create_guideline(
-            condition="When all required parameters are explicit, validated, and confirmed by the user.",
-            action=(
-                "Assemble a complete JSON bot specification with all required fields, validate it "
-                "against the schema, and call create_parlant_bot to instantiate the bot via REST API. "
-                "Provide the user with the created bot details including agent ID and confirmation."
-            ),
-            description="Only create bots from a fully validated specification using REST API.",
-            criticality=p.Criticality.HIGH,
-            tools=[create_parlant_bot],
-        )
+            await agent.create_guideline(
+                condition="When all required parameters are explicit, validated, and confirmed by the user.",
+                action=(
+                    "Assemble a complete JSON bot specification with all required fields, validate it "
+                    "against the schema, and call create_parlant_bot to instantiate the bot via REST API. "
+                    "Provide the user with the created bot details including agent ID and confirmation."
+                ),
+                description="Only create bots from a fully validated specification using REST API.",
+                criticality=p.Criticality.HIGH,
+                tools=[create_parlant_bot],
+            )
 
-        # Journey: Complete bot creation workflow
-        await agent.create_journey(
-            title="Bot Intake & Clarification",
-            description="Gather requirements, close gaps, validate specification, and create bot via API.",
-            conditions=[
-                "Start when the user describes a bot or requests a new bot.",
-                "Continue asking clarifying questions until all required parameters are explicit.",
-                "Validate the complete specification before calling the REST API.",
-            ],
-        )
-        
+            await agent.create_journey(
+                title="Bot Intake & Clarification",
+                description="Gather requirements, close gaps, validate specification, and create bot via API.",
+                conditions=[
+                    "Start when the user describes a bot or requests a new bot.",
+                    "Continue asking clarifying questions until all required parameters are explicit.",
+                    "Validate the complete specification before calling the REST API.",
+                ],
+            )
+            
+            print("-" * 50)
+            print(f"🌐 Server ready at http://localhost:{server.port}")
+            print("📖 Access Sandbox UI to interact with Otto")
+            print("⚡ Otto creates bots via REST API + persists to MongoDB")
+            print("-" * 50)
 
+    finally:
+        await shutdown_persistence()
 
 
 asyncio.run(main())
