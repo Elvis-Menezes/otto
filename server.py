@@ -1,17 +1,42 @@
 import asyncio
 import json
 import os
+import logging
 from typing import Any, Annotated
 
 import httpx
 import parlant.sdk as p
+from parlant.core.sessions import Event
 from dotenv import load_dotenv
 
 load_dotenv()
+os.makedirs("logs", exist_ok=True)
+os.environ['PARLANT_LOG_LEVEL'] = 'DEBUG'
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/openai.log'),
+        logging.StreamHandler()
+    ]
+)
+logging.getLogger("httpx").setLevel(logging.DEBUG)
+logging.getLogger("openai").setLevel(logging.DEBUG)
+
+# Dedicated logger for history trimming
+history_logger = logging.getLogger("history")
+history_logger.setLevel(logging.INFO)
+history_file_handler = logging.FileHandler("logs/history.log")
+history_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+history_logger.addHandler(history_file_handler)
 # Server configuration
 PARLANT_API_BASE_URL = os.getenv("PARLANT_API_BASE_URL", "http://localhost:8800")
 PARLANT_API_TIMEOUT = int(os.getenv("PARLANT_API_TIMEOUT", "30"))
+PARLANT_HISTORY_MAX_MESSAGES = int(os.getenv("PARLANT_HISTORY_MAX_MESSAGES", "20"))
+PARLANT_HISTORY_LOG_MESSAGES = os.getenv("PARLANT_HISTORY_LOG_MESSAGES", "false").lower() in {
+    "1", "true", "yes"
+}
 
 REQUIRED_SPEC_FIELDS = {
     "name",
@@ -34,6 +59,86 @@ COMPOSITION_MODES = {
     "COMPOSITED": p.CompositionMode.COMPOSITED,
     "STRICT": p.CompositionMode.STRICT,
 }
+
+
+def _trim_interaction_events(
+    events: list[Event],
+    max_messages: int,
+) -> list[Event]:
+    if max_messages <= 0:
+        return list(events)
+
+    message_indices = [
+        index for index, event in enumerate(events) if event.kind == p.EventKind.MESSAGE
+    ]
+    if len(message_indices) <= max_messages:
+        return list(events)
+
+    cutoff_index = message_indices[-max_messages]
+    return [
+        event for event in events[cutoff_index:] if event.kind != p.EventKind.STATUS
+    ]
+
+
+def _format_message_event(event: Event) -> str:
+    try:
+        data = event.data
+        participant = data.get("participant", {}) if isinstance(data, dict) else {}
+        name = participant.get("display_name", "Unknown") if isinstance(participant, dict) else "Unknown"
+        message = data.get("message", "") if isinstance(data, dict) else ""
+        return f"{name}: {message.strip()}"
+    except Exception:
+        return "<unavailable message event>"
+
+
+async def _configure_engine_hooks(hooks: p.EngineHooks) -> p.EngineHooks:
+    async def _trim_history_hook(
+        context: p.EngineContext,
+        _payload: Any,
+        _exc: Exception | None = None,
+    ) -> p.EngineHookResult:
+        events = list(context.interaction.events)
+        message_count_before = sum(
+            1 for event in events if event.kind == p.EventKind.MESSAGE
+        )
+        trimmed = _trim_interaction_events(events, PARLANT_HISTORY_MAX_MESSAGES)
+        
+        if len(trimmed) != len(events):
+            # Trimming happened
+            context.interaction = p.Interaction(events=trimmed)
+            message_count_after = sum(
+                1 for event in trimmed if event.kind == p.EventKind.MESSAGE
+            )
+            log_msg = (
+                f"TRIMMED: {message_count_before} -> {message_count_after} messages "
+                f"(limit: {PARLANT_HISTORY_MAX_MESSAGES})"
+            )
+            print(f"[History] {log_msg}")
+            history_logger.info(log_msg)
+            
+            if PARLANT_HISTORY_LOG_MESSAGES:
+                messages = [
+                    _format_message_event(event)
+                    for event in trimmed
+                    if event.kind == p.EventKind.MESSAGE
+                ]
+                if messages:
+                    print("[History] Messages sent to OpenAI:")
+                    history_logger.info("Messages sent to OpenAI:")
+                    for idx, msg in enumerate(messages, start=1):
+                        print(f"  {idx}. {msg}")
+                        history_logger.info(f"  {idx}. {msg}")
+        else:
+            # No trimming needed
+            log_msg = (
+                f"OK: {message_count_before} messages (limit: {PARLANT_HISTORY_MAX_MESSAGES})"
+            )
+            history_logger.info(log_msg)
+            
+        return p.EngineHookResult.CALL_NEXT
+
+    hooks.on_preparing.append(_trim_history_hook)
+    return hooks
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -583,9 +688,13 @@ async def main():
     print("🚀 Starting Otto Bot Creator Server...")
     print(f"📡 Parlant API: {PARLANT_API_BASE_URL}")
     print(f"⏱️  API Timeout: {PARLANT_API_TIMEOUT}s")
+    print(f"🧠 History limit: {PARLANT_HISTORY_MAX_MESSAGES} messages")
     print("-" * 50)
     
-    async with p.Server(nlp_service=p.NLPServices.openai) as server:
+    async with p.Server(
+        nlp_service=p.NLPServices.openai,
+        configure_hooks=_configure_engine_hooks,
+    ) as server:
         # Create Otto orchestrator agent
         agent = await server.create_agent(
             name="Otto",
