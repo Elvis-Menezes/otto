@@ -27,6 +27,8 @@ REQUIRED_SPEC_FIELDS = {
     "guidelines",
     "journeys",
 }
+RELATIONSHIP_TYPES = {"ENTAILMENT", "PRIORITY", "DEPENDENCY", "DISAMBIGUATION"}
+RELATIONSHIP_KINDS = {"guideline", "journey"}
 COMPOSITION_MODES = {
     "FLUID": p.CompositionMode.FLUID,
     "COMPOSITED": p.CompositionMode.COMPOSITED,
@@ -82,6 +84,113 @@ def _validate_journeys(journeys: Any) -> list[str]:
     return errors
 
 
+def _normalize_relationship_type(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return None
+
+
+def _relationship_ref_from_guideline(guideline: dict[str, Any]) -> str | None:
+    ref = guideline.get("key") or guideline.get("condition")
+    if isinstance(ref, str) and ref.strip():
+        return ref.strip()
+    return None
+
+
+def _relationship_ref_from_journey(journey: dict[str, Any]) -> str | None:
+    ref = journey.get("key") or journey.get("title")
+    if isinstance(ref, str) and ref.strip():
+        return ref.strip()
+    return None
+
+
+def _collect_relationship_refs(
+    items: list[dict[str, Any]],
+    ref_builder: callable,
+    kind: str,
+) -> tuple[dict[str, int], list[str]]:
+    errors: list[str] = []
+    refs: dict[str, int] = {}
+    for index, item in enumerate(items, start=1):
+        ref = ref_builder(item)
+        if not ref:
+            errors.append(f"{kind}[{index}] must include a non-empty key or reference field")
+            continue
+        if ref in refs:
+            errors.append(f"{kind}[{index}] reference '{ref}' must be unique")
+            continue
+        refs[ref] = index
+    return refs, errors
+
+
+def _validate_relationships(
+    relationships: Any,
+    guideline_refs: set[str],
+    journey_refs: set[str],
+) -> list[str]:
+    errors: list[str] = []
+    if relationships is None:
+        return errors
+    if not isinstance(relationships, list):
+        return ["relationships must be a list of objects"]
+    if not relationships:
+        return ["relationships must be a non-empty list when provided"]
+
+    for index, relationship in enumerate(relationships, start=1):
+        if not isinstance(relationship, dict):
+            errors.append(f"relationships[{index}] must be an object")
+            continue
+        rel_type = _normalize_relationship_type(relationship.get("type"))
+        if rel_type not in RELATIONSHIP_TYPES:
+            errors.append(
+                f"relationships[{index}].type must be one of {', '.join(sorted(RELATIONSHIP_TYPES))}"
+            )
+        source = relationship.get("source")
+        if not isinstance(source, str) or not source.strip():
+            errors.append(f"relationships[{index}].source must be a non-empty string")
+        targets = relationship.get("targets")
+        if targets is None:
+            target = relationship.get("target")
+            targets = [target] if target is not None else []
+        if not isinstance(targets, list) or not targets or not all(
+            isinstance(target, str) and target.strip() for target in targets
+        ):
+            errors.append(f"relationships[{index}].targets must be a non-empty list of strings")
+
+        source_kind = relationship.get("source_kind", "guideline")
+        target_kind = relationship.get("target_kind", source_kind)
+        if source_kind not in RELATIONSHIP_KINDS:
+            errors.append(
+                f"relationships[{index}].source_kind must be guideline or journey when provided"
+            )
+        if target_kind not in RELATIONSHIP_KINDS:
+            errors.append(
+                f"relationships[{index}].target_kind must be guideline or journey when provided"
+            )
+
+        source_refs = guideline_refs if source_kind == "guideline" else journey_refs
+        target_refs = guideline_refs if target_kind == "guideline" else journey_refs
+        if isinstance(source, str) and source.strip() and source.strip() not in source_refs:
+            errors.append(
+                f"relationships[{index}].source '{source}' does not match any {source_kind} reference"
+            )
+        if isinstance(targets, list):
+            for target in targets:
+                if isinstance(target, str) and target.strip() and target.strip() not in target_refs:
+                    errors.append(
+                        f"relationships[{index}].target '{target}' does not match any {target_kind} reference"
+                    )
+            if rel_type != "DISAMBIGUATION" and len(targets) != 1:
+                errors.append(
+                    f"relationships[{index}].targets must contain exactly one target unless type is DISAMBIGUATION"
+                )
+            if rel_type == "DISAMBIGUATION" and len(targets) < 2:
+                errors.append(
+                    f"relationships[{index}].targets must contain at least two targets for DISAMBIGUATION"
+                )
+    return errors
+
+
 def _validate_spec(spec: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     missing = REQUIRED_SPEC_FIELDS - spec.keys()
@@ -106,6 +215,26 @@ def _validate_spec(spec: dict[str, Any]) -> list[str]:
 
     errors.extend(_validate_guidelines(spec.get("guidelines")))
     errors.extend(_validate_journeys(spec.get("journeys")))
+
+    guideline_refs, guideline_errors = _collect_relationship_refs(
+        spec.get("guidelines", []),
+        _relationship_ref_from_guideline,
+        "guidelines",
+    )
+    journey_refs, journey_errors = _collect_relationship_refs(
+        spec.get("journeys", []),
+        _relationship_ref_from_journey,
+        "journeys",
+    )
+    errors.extend(guideline_errors)
+    errors.extend(journey_errors)
+    errors.extend(
+        _validate_relationships(
+            spec.get("relationships"),
+            set(guideline_refs.keys()),
+            set(journey_refs.keys()),
+        )
+    )
 
     composition_mode = spec.get("composition_mode")
     if composition_mode is not None and composition_mode not in COMPOSITION_MODES:
@@ -255,6 +384,15 @@ async def create_parlant_bot(
                             "conditions": ["When customer asks about delivery"]
                         }
                     ],
+                    "relationships": [
+                        {
+                            "type": "priority",
+                            "source": "The customer is becoming upset",
+                            "targets": ["The customer wants a coke"],
+                            "source_kind": "guideline",
+                            "target_kind": "guideline",
+                        }
+                    ],
                     "composition_mode": "FLUID",
                     "max_engine_iterations": 3
                 })
@@ -306,6 +444,7 @@ async def create_parlant_bot(
     
     # Step 2: Create guidelines via REST API
     created_guidelines = []
+    guideline_id_by_ref: dict[str, str] = {}
     for idx, guideline in enumerate(spec["guidelines"], 1):
         guideline_payload = {
             "condition": guideline["condition"],
@@ -320,6 +459,10 @@ async def create_parlant_bot(
                 "id": guideline_response.get("id"),
                 "condition": guideline["condition"]
             })
+            guideline_ref = _relationship_ref_from_guideline(guideline)
+            guideline_id = guideline_response.get("id")
+            if guideline_ref and guideline_id:
+                guideline_id_by_ref[guideline_ref] = guideline_id
         else:
             # Log but continue with other guidelines
             created_guidelines.append({
@@ -328,6 +471,7 @@ async def create_parlant_bot(
     
     # Step 3: Create journeys via REST API
     created_journeys = []
+    journey_id_by_ref: dict[str, str] = {}
     for idx, journey in enumerate(spec["journeys"], 1):
         journey_payload = {
             "title": journey["title"],
@@ -341,9 +485,73 @@ async def create_parlant_bot(
                 "id": journey_response.get("id"),
                 "title": journey["title"]
             })
+            journey_ref = _relationship_ref_from_journey(journey)
+            journey_id = journey_response.get("id")
+            if journey_ref and journey_id:
+                journey_id_by_ref[journey_ref] = journey_id
         else:
             created_journeys.append({
                 "error": f"Journey {idx} failed: {journey_response.get('error')}"
+            })
+
+    # Step 4: Create relationships via REST API (optional)
+    created_relationships = []
+    for idx, relationship in enumerate(spec.get("relationships", []), 1):
+        rel_type = _normalize_relationship_type(relationship.get("type"))
+        source_kind = relationship.get("source_kind", "guideline")
+        target_kind = relationship.get("target_kind", source_kind)
+        
+        source_ref = relationship.get("source")
+        targets = relationship.get("targets")
+        if targets is None:
+            target = relationship.get("target")
+            targets = [target] if target is not None else []
+
+        if source_kind == "guideline":
+            source_id = guideline_id_by_ref.get(source_ref or "")
+        else:
+            source_id = journey_id_by_ref.get(source_ref or "")
+
+        target_ids: list[str] = []
+        if target_kind == "guideline":
+            target_ids = [guideline_id_by_ref.get(t or "", "") for t in targets or []]
+        else:
+            target_ids = [journey_id_by_ref.get(t or "", "") for t in targets or []]
+        target_ids = [target_id for target_id in target_ids if target_id]
+
+        if not rel_type or not source_id or not target_ids:
+            created_relationships.append({
+                "error": f"Relationship {idx} failed: missing resolved IDs",
+                "type": relationship.get("type"),
+                "source": source_ref,
+                "targets": targets,
+            })
+            continue
+
+        relationship_payload = {
+            "type": rel_type.lower(),
+            "source_id": source_id,
+            "target_ids": target_ids,
+            "source_kind": source_kind,
+            "target_kind": target_kind,
+        }
+
+        success, relationship_response = await _call_parlant_api(
+            "POST",
+            "/relationships",
+            relationship_payload,
+        )
+        if success:
+            created_relationships.append({
+                "id": relationship_response.get("id"),
+                "type": rel_type.lower(),
+                "source_id": source_id,
+                "target_ids": target_ids,
+            })
+        else:
+            created_relationships.append({
+                "error": f"Relationship {idx} failed: {relationship_response.get('error')}",
+                "details": relationship_response.get("details"),
             })
     
     return p.ToolResult(
@@ -353,8 +561,10 @@ async def create_parlant_bot(
             "agent_name": agent_name,
             "guidelines_created": len([g for g in created_guidelines if "id" in g]),
             "journeys_created": len([j for j in created_journeys if "id" in j]),
+            "relationships_created": len([r for r in created_relationships if "id" in r]),
             "guidelines": created_guidelines,
             "journeys": created_journeys,
+            "relationships": created_relationships,
             "api_base_url": PARLANT_API_BASE_URL,
         }
     )
