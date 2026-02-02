@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bot Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-icon">🤖</div>
+          <div>
+            <div class="brand-title">Bot Console</div>
+            <div class="brand-subtitle">Parlant</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-item active" href="#">Bots</a>
+          <a class="nav-item" href="#">Chat</a>
+          <a class="nav-item" href="#">Analytics</a>
+          <a class="nav-item" href="#">Settings</a>
+        </nav>
+        <div class="sidebar-footer">Workspace • Production</div>
+      </aside>
+
+      <main class="content">
+        <header class="page-header">
+          <div>
+            <div class="page-title">AI Bots</div>
+            <div class="page-subtitle">Create &amp; manage AI bots</div>
+          </div>
+          <div class="header-actions">
+            <button class="btn ghost" id="refreshButton">Refresh</button>
+          </div>
+        </header>
+
+        <section class="bot-grid" id="botGrid" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <!-- Create Bot Modal -->
+    <div class="modal hidden" id="botModal" role="dialog" aria-modal="true">
+      <div class="modal-overlay" id="modalOverlay"></div>
+      <div class="modal-card large" role="document">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">Create a new bot</div>
+            <div class="modal-subtitle">Fill in the bot specification</div>
+          </div>
+          <button class="icon-button" id="closeModalButton" aria-label="Close modal">✕</button>
+        </div>
+
+        <!-- Step Indicators -->
+        <div class="step-indicators">
+          <div class="step-indicator active" data-step="1">
+            <span class="step-number">1</span>
+            <span class="step-label">Basic Info</span>
+          </div>
+          <div class="step-connector"></div>
+          <div class="step-indicator" data-step="2">
+            <span class="step-number">2</span>
+            <span class="step-label">Guidelines</span>
+          </div>
+          <div class="step-connector"></div>
+          <div class="step-indicator" data-step="3">
+            <span class="step-number">3</span>
+            <span class="step-label">Journeys</span>
+          </div>
+        </div>
+
+        <form class="modal-body" id="botForm">
+          <!-- Step 1: Basic Information -->
+          <div id="stepBasic" class="form-step">
+            <div class="form-grid">
+              <label class="field">
+                <span class="field-label">Bot Name *</span>
+                <input class="field-input" id="botName" placeholder="e.g., Reva Support" required />
+              </label>
+
+              <label class="field">
+                <span class="field-label">Tone *</span>
+                <input class="field-input" id="botTone" placeholder="e.g., Friendly, professional" required />
+              </label>
+
+              <label class="field full-width">
+                <span class="field-label">Purpose *</span>
+                <textarea class="field-input" id="botPurpose" rows="2" placeholder="What is this bot's primary purpose?" required></textarea>
+              </label>
+
+              <label class="field full-width">
+                <span class="field-label">Scope *</span>
+                <textarea class="field-input" id="botScope" rows="2" placeholder="What does this bot handle?" required></textarea>
+              </label>
+
+              <label class="field">
+                <span class="field-label">Target Users *</span>
+                <input class="field-input" id="botTargetUsers" placeholder="e.g., Existing customers" required />
+              </label>
+
+              <label class="field">
+                <span class="field-label">Personality *</span>
+                <input class="field-input" id="botPersonality" placeholder="e.g., Helpful assistant" required />
+              </label>
+
+              <label class="field full-width">
+                <span class="field-label">Use Cases * (one per line)</span>
+                <textarea class="field-input" id="botUseCases" rows="3" placeholder="Track order status&#10;Cancel an order&#10;Request refund" required></textarea>
+              </label>
+
+              <label class="field">
+                <span class="field-label">Tools (comma separated)</span>
+                <input class="field-input" id="botTools" placeholder="none" value="none" />
+              </label>
+
+              <label class="field full-width">
+                <span class="field-label">Constraints * (one per line)</span>
+                <textarea class="field-input" id="botConstraints" rows="2" placeholder="30-day cancellation policy&#10;Cannot modify shipped orders" required></textarea>
+              </label>
+
+              <label class="field full-width">
+                <span class="field-label">Guardrails * (one per line)</span>
+                <textarea class="field-input" id="botGuardrails" rows="2" placeholder="Verify order number before actions&#10;Never share customer data" required></textarea>
+              </label>
+            </div>
+          </div>
+
+          <!-- Step 2: Guidelines -->
+          <div id="stepGuidelines" class="form-step hidden">
+            <div class="step-intro">
+              <p>Define behavior rules for your bot. Each guideline has a condition (trigger) and an action (response).</p>
+            </div>
+            
+            <div id="guidelinesList" class="dynamic-list"></div>
+            
+            <button type="button" class="btn ghost add-item-btn" onclick="addGuideline()">
+              + Add Guideline
+            </button>
+          </div>
+
+          <!-- Step 3: Journeys -->
+          <div id="stepJourneys" class="form-step hidden">
+            <div class="step-intro">
+              <p>Define conversation flows. Each journey represents a user goal and when to trigger it.</p>
+            </div>
+            
+            <div id="journeysList" class="dynamic-list"></div>
+            
+            <button type="button" class="btn ghost add-item-btn" onclick="addJourney()">
+              + Add Journey
+            </button>
+          </div>
+
+          <!-- Form Actions -->
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" id="cancelModalButton">Cancel</button>
+            <div class="action-spacer"></div>
+            <button type="button" class="btn ghost" id="prevStepButton" style="display: none;">Previous</button>
+            <button type="button" class="btn primary" id="nextStepButton">Next</button>
+            <button type="submit" class="btn primary" id="submitBotButton" style="display: none;">Create Bot</button>
+          </div>
+          
+          <div class="form-status" id="formStatus"></div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Chat Modal -->
+    <div class="modal hidden" id="chatModal" role="dialog" aria-modal="true">
+      <div class="modal-overlay" id="chatModalOverlay"></div>
+      <div class="modal-card chat-modal" role="document">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title" id="chatBotName">Chat with Bot</div>
+            <div class="modal-subtitle" id="chatSessionId">Session: --</div>
+          </div>
+          <button class="icon-button" id="closeChatButton" aria-label="Close chat">✕</button>
+        </div>
+        <div class="chat-container">
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-welcome">
+              <div class="chat-welcome-icon">💬</div>
+              <div class="chat-welcome-text">Start a conversation with this bot</div>
+            </div>
+          </div>
+          <div class="chat-input-container">
+            <input type="text" class="chat-input" id="chatInput" placeholder="Type a message..." autocomplete="off" />
+            <button class="btn primary" id="sendMessageButton">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bot Detail Modal -->
+    <div class="modal hidden" id="detailModal" role="dialog" aria-modal="true">
+      <div class="modal-overlay" id="detailModalOverlay"></div>
+      <div class="modal-card detail-modal" role="document">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">Bot Details</div>
+            <div class="modal-subtitle">Manage guidelines and journeys</div>
+          </div>
+          <button class="icon-button" id="closeDetailButton" aria-label="Close">✕</button>
+        </div>
+        <div class="detail-body" id="detailContent">
+          <!-- Populated by JavaScript -->
+        </div>
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

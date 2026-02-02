@@ -154,6 +154,16 @@ async def rehydrate_bots_from_persistence(
                 new_parlant_id = agent.id
                 stats["id_mapping"][old_bot_id] = new_parlant_id
                 
+                # CRITICAL: Update MongoDB with the new Parlant ID so chat works!
+                # The web UI uses the bot_id from MongoDB to create sessions
+                if old_bot_id != new_parlant_id:
+                    try:
+                        await persistence.update_bot_id(old_bot_id, new_parlant_id)
+                        print(f"  🔄 Updated MongoDB bot_id: {old_bot_id} → {new_parlant_id}")
+                    except Exception as e:
+                        print(f"  ⚠️  Failed to update bot_id in MongoDB: {e}")
+                        stats["errors"].append(f"ID update failed for {bot_name}: {e}")
+                
                 stats["bots_restored"] += 1
                 print(f"  ✅ Restored bot: {bot_name}")
                 print(f"      MongoDB ID: {old_bot_id}")
