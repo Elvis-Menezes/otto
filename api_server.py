@@ -69,12 +69,16 @@ load_dotenv()
 
 # Import domain persistence for MongoDB mirroring
 try:
-    from domain_persistence import get_persistence
+    from domain_persistence import get_persistence, initialize_persistence, shutdown_persistence
     PERSISTENCE_AVAILABLE = True
 except ImportError:
     PERSISTENCE_AVAILABLE = False
     def get_persistence():
         return None
+    async def initialize_persistence(uri):
+        return False, "Not available"
+    async def shutdown_persistence():
+        pass
 
 # =============================================================================
 # Configuration
@@ -86,6 +90,8 @@ PARLANT_API_TOKEN = os.getenv("PARLANT_API_TOKEN")
 API_PORT = int(os.getenv("API_PORT", "8801"))
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 
+# MongoDB configuration
+MONGODB_URI = os.getenv("MONGODB_URI")
 
 # =============================================================================
 # Parlant API Client
@@ -358,12 +364,25 @@ async def lifespan(app: FastAPI):
         token=PARLANT_API_TOKEN,
     )
     
-    # Verify connectivity
+    # Verify Parlant connectivity
     success, _ = await _client.list_agents()
     if success:
         print("✅ Connected to Parlant API")
     else:
         print("⚠️  Parlant API not available - will retry on requests")
+    
+    # Initialize MongoDB persistence for mirroring
+    if PERSISTENCE_AVAILABLE and MONGODB_URI:
+        print(f"🗄️  Initializing MongoDB persistence...")
+        success, message = await initialize_persistence(MONGODB_URI)
+        if success:
+            print(f"✅ {message}")
+            print("📝 CRUD operations will be mirrored to MongoDB")
+        else:
+            print(f"⚠️  {message}")
+            print("📝 MongoDB mirroring disabled")
+    else:
+        print("📝 MongoDB mirroring disabled (no MONGODB_URI)")
     
     print("-" * 60)
     print(f"🌐 API Server ready on http://{API_HOST}:{API_PORT}")
@@ -372,7 +391,11 @@ async def lifespan(app: FastAPI):
     
     yield
     
+    # Shutdown
     print("👋 Shutting down Bot Management API...")
+    if PERSISTENCE_AVAILABLE:
+        await shutdown_persistence()
+        print("🗄️  MongoDB connection closed")
 
 
 # =============================================================================
@@ -754,6 +777,29 @@ async def create_guideline(request: GuidelineCreate):
     if not success:
         raise HTTPException(400, f"Failed to create guideline: {response.get('error')}")
     
+    # Mirror CREATE to MongoDB
+    if PERSISTENCE_AVAILABLE:
+        try:
+            persistence = get_persistence()
+            if persistence and persistence.enabled:
+                # Extract bot_id from tags
+                bot_id = None
+                for tag in (request.tags or []):
+                    if tag.startswith("agent:"):
+                        bot_id = tag.replace("agent:", "")
+                        break
+                if bot_id:
+                    await persistence.persist_guideline(
+                        guideline_id=response.get("id"),
+                        bot_id=bot_id,
+                        condition=request.condition,
+                        action=request.action,
+                        description=request.description,
+                        criticality=_map_criticality(request.criticality),
+                    )
+        except Exception as e:
+            print(f"⚠️  MongoDB mirror failed for guideline create: {e}")
+    
     return {
         "status": "created",
         "guideline_id": response.get("id"),
@@ -852,6 +898,22 @@ async def add_guideline_to_bot(bot_id: str, request: GuidelineCreate):
     if not success:
         raise HTTPException(400, f"Failed to create guideline: {response.get('error')}")
     
+    # Mirror CREATE to MongoDB
+    if PERSISTENCE_AVAILABLE:
+        try:
+            persistence = get_persistence()
+            if persistence and persistence.enabled:
+                await persistence.persist_guideline(
+                    guideline_id=response.get("id"),
+                    bot_id=bot_id,
+                    condition=request.condition,
+                    action=request.action,
+                    description=request.description,
+                    criticality=_map_criticality(request.criticality),
+                )
+        except Exception as e:
+            print(f"⚠️  MongoDB mirror failed for guideline create: {e}")
+    
     return {
         "status": "created",
         "guideline_id": response.get("id"),
@@ -907,6 +969,28 @@ async def create_journey(request: JourneyCreate):
     success, response = await _client.create_journey(payload)
     if not success:
         raise HTTPException(400, f"Failed to create journey: {response.get('error')}")
+    
+    # Mirror CREATE to MongoDB
+    if PERSISTENCE_AVAILABLE:
+        try:
+            persistence = get_persistence()
+            if persistence and persistence.enabled:
+                # Extract bot_id from tags
+                bot_id = None
+                for tag in (request.tags or []):
+                    if tag.startswith("agent:"):
+                        bot_id = tag.replace("agent:", "")
+                        break
+                if bot_id:
+                    await persistence.persist_journey(
+                        journey_id=response.get("id"),
+                        bot_id=bot_id,
+                        title=request.title,
+                        description=request.description,
+                        conditions=request.conditions,
+                    )
+        except Exception as e:
+            print(f"⚠️  MongoDB mirror failed for journey create: {e}")
     
     return {
         "status": "created",
@@ -1001,6 +1085,21 @@ async def add_journey_to_bot(bot_id: str, request: JourneyCreate):
     success, response = await _client.create_journey(payload)
     if not success:
         raise HTTPException(400, f"Failed to create journey: {response.get('error')}")
+    
+    # Mirror CREATE to MongoDB
+    if PERSISTENCE_AVAILABLE:
+        try:
+            persistence = get_persistence()
+            if persistence and persistence.enabled:
+                await persistence.persist_journey(
+                    journey_id=response.get("id"),
+                    bot_id=bot_id,
+                    title=request.title,
+                    description=request.description,
+                    conditions=request.conditions,
+                )
+        except Exception as e:
+            print(f"⚠️  MongoDB mirror failed for journey create: {e}")
     
     return {
         "status": "created",
