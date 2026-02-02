@@ -1,7 +1,7 @@
-# Otto Bot Creator Server - Dependencies
+# Otto Bot Creator Server - Production Dependencies
 
-# Parlant SDK for agent orchestration
-parlant>=3.1.2
+# Parlant SDK with MongoDB support
+parlant[mongo]>=3.1.2
 
 # HTTP client for REST API calls
 httpx>=0.28.0
@@ -12,6 +12,15 @@ python-dotenv>=1.0.0
 # OpenAI integration (required for NLP)
 openai>=1.0.0
 
-# MongoDB support for persistent storage
+# MongoDB support (included in parlant[mongo] but explicit for clarity)
 pymongo>=4.6.0
 motor>=3.3.0
+certifi>=2023.0.0
+
+# FastAPI for HTTP API server
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+
+# Production utilities
+python-json-logger>=2.0.0

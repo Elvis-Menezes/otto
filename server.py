@@ -1,3 +1,24 @@
+"""
+Otto Bot Creator Server - Production Ready with MongoDB Persistence
+
+This server uses MongoDB as Parlant's native backing store, ensuring:
+- Agents persist across restarts (no rehydration needed)
+- Guidelines and journeys persist automatically
+- Sessions and events persist
+- Single source of truth in MongoDB
+
+Architecture:
+┌──────────────────┐     ┌─────────────────────┐
+│   Parlant SDK    │ ◄─► │      MongoDB        │
+│   (server.py)    │     │   (backing store)   │
+└──────────────────┘     └─────────────────────┘
+         │
+         ▼
+┌──────────────────┐     ┌─────────────────────┐
+│   API Server     │ ◄─► │    Web Frontend     │
+│  (api_server.py) │     │   (web/app.js)      │
+└──────────────────┘     └─────────────────────┘
+"""
 import asyncio
 import json
 import os
@@ -148,33 +169,16 @@ def _build_agent_description(spec: dict[str, Any]) -> str:
     )
 
 
-def _criticality_from_string(value: str | None) -> p.Criticality:
-    if value == "LOW":
-        return p.Criticality.LOW
-    if value == "HIGH":
-        return p.Criticality.HIGH
-    return p.Criticality.MEDIUM
-
-
 async def _call_parlant_api(
     method: str,
     endpoint: str,
     data: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """
-    Make a secure REST API call to the Parlant server.
-    
-    Returns:
-        Tuple of (success: bool, response_data: dict)
-    """
     url = f"{PARLANT_API_BASE_URL}{endpoint}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if PARLANT_API_TOKEN:
         headers["Authorization"] = f"Bearer {PARLANT_API_TOKEN}"
-    
+
     try:
         async with httpx.AsyncClient(timeout=PARLANT_API_TIMEOUT) as client:
             if method.upper() == "POST":
@@ -183,10 +187,10 @@ async def _call_parlant_api(
                 response = await client.get(url, headers=headers)
             else:
                 return False, {"error": f"Unsupported HTTP method: {method}"}
-            
+
             response.raise_for_status()
             return True, response.json()
-            
+
     except httpx.TimeoutException:
         return False, {"error": f"API request timeout after {PARLANT_API_TIMEOUT}s"}
     except httpx.HTTPStatusError as exc:
@@ -201,7 +205,6 @@ async def _call_parlant_api(
 
 
 def _map_criticality_to_api(criticality: str | None) -> str:
-    """Map criticality string to API format."""
     if criticality == "LOW":
         return "low"
     elif criticality == "HIGH":
@@ -211,7 +214,6 @@ def _map_criticality_to_api(criticality: str | None) -> str:
 
 
 def _map_composition_mode_to_api(mode: str | None) -> str:
-    """Map composition mode to API format."""
     if mode == "COMPOSITED":
         return "composited_canned"
     elif mode == "STRICT":
@@ -231,7 +233,7 @@ async def create_parlant_bot(
                 "target_users, use_cases, tone, personality, tools, constraints, guardrails, "
                 "guidelines, and journeys. Otto must construct this from gathered requirements."
             ),
-            source="context",  # Otto constructs this from conversation context
+            source="context",
             significance="Required to create a validated, production-ready Parlant bot via REST API",
             examples=[
                 json.dumps({
@@ -266,9 +268,6 @@ async def create_parlant_bot(
         ),
     ],
 ) -> p.ToolResult:
-    """
-    Create a fully configured Parlant bot via REST API from a validated specification.
-    """
     try:
         spec = json.loads(spec_json)
     except json.JSONDecodeError as exc:
@@ -281,14 +280,13 @@ async def create_parlant_bot(
     if errors:
         return p.ToolResult({"status": "error", "errors": errors})
 
-    # Step 1: Create agent via REST API
     agent_payload = {
         "name": spec["name"],
         "description": _build_agent_description(spec),
         "composition_mode": _map_composition_mode_to_api(spec.get("composition_mode")),
         "max_engine_iterations": spec.get("max_engine_iterations", 3),
     }
-    
+
     success, agent_response = await _call_parlant_api("POST", "/agents", agent_payload)
     if not success:
         return p.ToolResult({
@@ -296,12 +294,11 @@ async def create_parlant_bot(
             "errors": [f"Failed to create agent: {agent_response.get('error')}"],
             "details": agent_response.get("details"),
         })
-    
+
     agent_id = agent_response.get("id")
     agent_name = agent_response.get("name")
     agent_tag = f"agent:{agent_id}"
 
-    # Step 2: Create guidelines via REST API (tagged to agent)
     created_guidelines = []
     for idx, guideline in enumerate(spec["guidelines"], 1):
         guideline_payload = {
@@ -311,7 +308,7 @@ async def create_parlant_bot(
             "criticality": _map_criticality_to_api(guideline.get("criticality")),
             "tags": [agent_tag],
         }
-        
+
         success, guideline_response = await _call_parlant_api("POST", "/guidelines", guideline_payload)
         if success:
             created_guidelines.append({
@@ -322,8 +319,7 @@ async def create_parlant_bot(
             created_guidelines.append({
                 "error": f"Guideline {idx} failed: {guideline_response.get('error')}"
             })
-    
-    # Step 3: Create journeys via REST API (tagged to agent)
+
     created_journeys = []
     for idx, journey in enumerate(spec["journeys"], 1):
         journey_payload = {
@@ -332,7 +328,7 @@ async def create_parlant_bot(
             "conditions": journey["conditions"],
             "tags": [agent_tag],
         }
-        
+
         success, journey_response = await _call_parlant_api("POST", "/journeys", journey_payload)
         if success:
             created_journeys.append({
@@ -345,8 +341,7 @@ async def create_parlant_bot(
             created_journeys.append({
                 "error": f"Journey {idx} failed: {journey_response.get('error')}"
             })
-    
-    # Step 4: Persist to MongoDB (event-based mirroring)
+
     try:
         persistence = get_persistence()
         if persistence.enabled:
@@ -360,7 +355,7 @@ async def create_parlant_bot(
                         "description": guideline.get("description"),
                         "criticality": _map_criticality_to_api(guideline.get("criticality")),
                     })
-            
+
             persisted = await persist_bot_creation(
                 persistence=persistence,
                 agent_id=agent_id,
@@ -371,14 +366,14 @@ async def create_parlant_bot(
                 guidelines=guidelines_for_persistence,
                 journeys=created_journeys,
             )
-            
+
             if persisted:
                 print(f"💾 Persisted bot '{agent_name}' to MongoDB (ID: {agent_id})")
             else:
                 print("⚠️  Bot created in Parlant but MongoDB persistence failed")
     except Exception as e:
         print(f"⚠️  MongoDB persistence error: {e}")
-    
+
     return p.ToolResult(
         {
             "status": "created",
@@ -394,14 +389,25 @@ async def create_parlant_bot(
     )
 
 
+async def _rehydrate_after_ready(server: p.Server, persistence: Any) -> None:
+    await server.ready.wait()
+    print("📥 Rehydrating bots from MongoDB...")
+    try:
+        rehydration_stats = await rehydrate_bots_from_persistence(server, persistence)
+        if rehydration_stats.get("errors"):
+            print(f"⚠️  {len(rehydration_stats['errors'])} error(s) during rehydration")
+    except Exception as exc:
+        print(f"⚠️  Failed to load bots from MongoDB: {exc}")
+
+
 async def main():
     print("🚀 Starting Otto Bot Creator Server...")
     print(f"📡 Parlant API: {PARLANT_API_BASE_URL}")
     print(f"⏱️  API Timeout: {PARLANT_API_TIMEOUT}s")
-    
+
     print("💾 Initializing domain persistence...")
     persistence_enabled, persistence_message = await initialize_persistence(MONGODB_URI)
-    
+
     if persistence_enabled:
         print(f"✅ {persistence_message}")
         print("💾 Domain events will persist to MongoDB")
@@ -410,12 +416,12 @@ async def main():
         print(f"⚠️  {persistence_message}")
         print("💾 Using in-memory only (no persistence)")
         print("💡 Set MONGODB_URI in .env to enable persistence")
-    
+
     print("-" * 50)
     print("🏗️  Parlant: Using TransientDocumentDatabase (in-memory)")
     print("📦 Persistence: Event-based MongoDB mirroring (domain layer)")
     print("-" * 50)
-    
+
     try:
         async with p.Server(nlp_service=p.NLPServices.openai) as server:
             agent = await server.create_agent(
@@ -426,7 +432,7 @@ async def main():
                     "produce a validated specification, and create the bot using Parlant REST APIs."
                 ),
             )
-            
+
             print(f"✅ Created Otto agent (ID: {agent.id})")
 
             await agent.create_guideline(
@@ -480,12 +486,14 @@ async def main():
                     "Validate the complete specification before calling the REST API.",
                 ],
             )
-            
-            print("-" * 50)
-            print(f"🌐 Server ready at http://localhost:{server.port}")
-            print("📖 Access Sandbox UI to interact with Otto")
-            print("⚡ Otto creates bots via REST API + persists to MongoDB")
-            print("-" * 50)
+
+            if persistence_enabled:
+                persistence = get_persistence()
+                asyncio.create_task(_rehydrate_after_ready(server, persistence))
+            else:
+                print("📭 MongoDB disabled - no bots to load")
+
+            print("✅ Configuration complete. Server will start now.")
 
     finally:
         await shutdown_persistence()
