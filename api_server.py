@@ -603,8 +603,9 @@ async def create_bot(request: BotCreateRequest):
     agent_id = agent_response.get("id")
     agent_tag = f"agent:{agent_id}"
     
-    # Create guidelines
+    # Create guidelines and track their IDs for MongoDB persistence
     guidelines_created = 0
+    created_guidelines = []
     for guideline in spec.get("guidelines", []):
         payload = {
             "condition": guideline.get("condition"),
@@ -613,12 +614,20 @@ async def create_bot(request: BotCreateRequest):
             "criticality": _map_criticality(guideline.get("criticality")),
             "tags": [agent_tag],
         }
-        success, _ = await _client.create_guideline(payload)
+        success, guideline_response = await _client.create_guideline(payload)
         if success:
             guidelines_created += 1
+            created_guidelines.append({
+                "id": guideline_response.get("id"),
+                "condition": guideline.get("condition"),
+                "action": guideline.get("action"),
+                "description": guideline.get("description"),
+                "criticality": guideline.get("criticality"),
+            })
     
-    # Create journeys
+    # Create journeys and track their IDs for MongoDB persistence
     journeys_created = 0
+    created_journeys = []
     for journey in spec.get("journeys", []):
         payload = {
             "title": journey.get("title"),
@@ -626,9 +635,65 @@ async def create_bot(request: BotCreateRequest):
             "conditions": journey.get("conditions"),
             "tags": [agent_tag],
         }
-        success, _ = await _client.create_journey(payload)
+        success, journey_response = await _client.create_journey(payload)
         if success:
             journeys_created += 1
+            created_journeys.append({
+                "id": journey_response.get("id"),
+                "title": journey.get("title"),
+                "description": journey.get("description"),
+                "conditions": journey.get("conditions"),
+            })
+    
+    # Mirror CREATE to MongoDB for persistence (bot, guidelines, and journeys)
+    if PERSISTENCE_AVAILABLE:
+        try:
+            persistence = get_persistence()
+            if persistence and persistence.enabled:
+                # Persist bot
+                await persistence.persist_bot(
+                    bot_id=agent_id,
+                    name=spec["name"],
+                    description=_build_description(spec),
+                    composition_mode=_map_composition_mode(spec.get("composition_mode")),
+                    max_engine_iterations=spec.get("max_engine_iterations", 3),
+                    metadata={
+                        "purpose": spec.get("purpose"),
+                        "scope": spec.get("scope"),
+                        "target_users": spec.get("target_users"),
+                        "tone": spec.get("tone"),
+                        "personality": spec.get("personality"),
+                        "use_cases": spec.get("use_cases"),
+                        "tools": spec.get("tools"),
+                        "constraints": spec.get("constraints"),
+                        "guardrails": spec.get("guardrails"),
+                    }
+                )
+                
+                # Persist guidelines
+                for g in created_guidelines:
+                    await persistence.persist_guideline(
+                        guideline_id=g["id"],
+                        bot_id=agent_id,
+                        condition=g["condition"],
+                        action=g["action"],
+                        description=g["description"],
+                        criticality=_map_criticality(g["criticality"]),
+                    )
+                
+                # Persist journeys
+                for j in created_journeys:
+                    await persistence.persist_journey(
+                        journey_id=j["id"],
+                        bot_id=agent_id,
+                        title=j["title"],
+                        description=j["description"],
+                        conditions=j["conditions"],
+                    )
+                
+                print(f"💾 MongoDB mirrored: CREATE bot {agent_id} ({spec['name']}) with {guidelines_created} guidelines, {journeys_created} journeys")
+        except Exception as e:
+            print(f"⚠️  MongoDB mirror failed for bot create: {e}")
     
     return {
         "success": True,

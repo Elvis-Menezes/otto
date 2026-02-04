@@ -22,10 +22,23 @@ Architecture:
 import asyncio
 import json
 import os
+import logging
 from typing import Any, Annotated
-
 import httpx
+
+# Import Composio tools from separate module
+from composio_tools import (
+    ALL_COMPOSIO_TOOLS,
+    connect_composio_account,
+    check_composio_connection,
+    execute_composio_tool,
+    list_composio_tools,
+    github_create_issue,
+    slack_send_message,
+    gmail_send_email,
+)
 import parlant.sdk as p
+from parlant.core.sessions import Event
 from dotenv import load_dotenv
 
 # Import domain persistence layer (event-based, not Parlant internals)
@@ -33,14 +46,29 @@ from domain_persistence import initialize_persistence, get_persistence, shutdown
 from domain_rehydration import rehydrate_bots_from_persistence, persist_bot_creation
 
 load_dotenv()
+os.makedirs("logs", exist_ok=True)
+os.environ['PARLANT_LOG_LEVEL'] = 'DEBUG'
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/openai.log'),
+        logging.StreamHandler()
+    ]
+)
+logging.getLogger("httpx").setLevel(logging.DEBUG)
+logging.getLogger("openai").setLevel(logging.DEBUG)
+
+# Dedicated logger for history trimming
+history_logger = logging.getLogger("history")
+history_logger.setLevel(logging.INFO)
+history_file_handler = logging.FileHandler("logs/history.log")
+history_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+history_logger.addHandler(history_file_handler)
 # Server configuration
 PARLANT_API_BASE_URL = os.getenv("PARLANT_API_BASE_URL", "http://localhost:8800")
 PARLANT_API_TIMEOUT = int(os.getenv("PARLANT_API_TIMEOUT", "30"))
-PARLANT_API_TOKEN = os.getenv("PARLANT_API_TOKEN")  # Optional bearer token
-
-# MongoDB configuration (for domain persistence, NOT Parlant internal storage)
-MONGODB_URI = os.getenv("MONGODB_URI", None)
 
 REQUIRED_SPEC_FIELDS = {
     "name",
@@ -56,11 +84,93 @@ REQUIRED_SPEC_FIELDS = {
     "guidelines",
     "journeys",
 }
+RELATIONSHIP_TYPES = {"ENTAILMENT", "PRIORITY", "DEPENDENCY", "DISAMBIGUATION"}
+RELATIONSHIP_KINDS = {"guideline", "journey"}
 COMPOSITION_MODES = {
     "FLUID": p.CompositionMode.FLUID,
     "COMPOSITED": p.CompositionMode.COMPOSITED,
     "STRICT": p.CompositionMode.STRICT,
 }
+
+
+def _trim_interaction_events(
+    events: list[Event],
+    max_messages: int,
+) -> list[Event]:
+    if max_messages <= 0:
+        return list(events)
+
+    message_indices = [
+        index for index, event in enumerate(events) if event.kind == p.EventKind.MESSAGE
+    ]
+    if len(message_indices) <= max_messages:
+        return list(events)
+
+    cutoff_index = message_indices[-max_messages]
+    return [
+        event for event in events[cutoff_index:] if event.kind != p.EventKind.STATUS
+    ]
+
+
+def _format_message_event(event: Event) -> str:
+    try:
+        data = event.data
+        participant = data.get("participant", {}) if isinstance(data, dict) else {}
+        name = participant.get("display_name", "Unknown") if isinstance(participant, dict) else "Unknown"
+        message = data.get("message", "") if isinstance(data, dict) else ""
+        return f"{name}: {message.strip()}"
+    except Exception:
+        return "<unavailable message event>"
+
+
+async def _configure_engine_hooks(hooks: p.EngineHooks) -> p.EngineHooks:
+    async def _trim_history_hook(
+        context: p.EngineContext,
+        _payload: Any,
+        _exc: Exception | None = None,
+    ) -> p.EngineHookResult:
+        events = list(context.interaction.events)
+        message_count_before = sum(
+            1 for event in events if event.kind == p.EventKind.MESSAGE
+        )
+        trimmed = _trim_interaction_events(events, PARLANT_HISTORY_MAX_MESSAGES)
+        
+        if len(trimmed) != len(events):
+            # Trimming happened
+            context.interaction = p.Interaction(events=trimmed)
+            message_count_after = sum(
+                1 for event in trimmed if event.kind == p.EventKind.MESSAGE
+            )
+            log_msg = (
+                f"TRIMMED: {message_count_before} -> {message_count_after} messages "
+                f"(limit: {PARLANT_HISTORY_MAX_MESSAGES})"
+            )
+            print(f"[History] {log_msg}")
+            history_logger.info(log_msg)
+            
+            if PARLANT_HISTORY_LOG_MESSAGES:
+                messages = [
+                    _format_message_event(event)
+                    for event in trimmed
+                    if event.kind == p.EventKind.MESSAGE
+                ]
+                if messages:
+                    print("[History] Messages sent to OpenAI:")
+                    history_logger.info("Messages sent to OpenAI:")
+                    for idx, msg in enumerate(messages, start=1):
+                        print(f"  {idx}. {msg}")
+                        history_logger.info(f"  {idx}. {msg}")
+        else:
+            # No trimming needed
+            log_msg = (
+                f"OK: {message_count_before} messages (limit: {PARLANT_HISTORY_MAX_MESSAGES})"
+            )
+            history_logger.info(log_msg)
+            
+        return p.EngineHookResult.CALL_NEXT
+
+    hooks.on_preparing.append(_trim_history_hook)
+    return hooks
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -111,6 +221,113 @@ def _validate_journeys(journeys: Any) -> list[str]:
     return errors
 
 
+def _normalize_relationship_type(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return None
+
+
+def _relationship_ref_from_guideline(guideline: dict[str, Any]) -> str | None:
+    ref = guideline.get("key") or guideline.get("condition")
+    if isinstance(ref, str) and ref.strip():
+        return ref.strip()
+    return None
+
+
+def _relationship_ref_from_journey(journey: dict[str, Any]) -> str | None:
+    ref = journey.get("key") or journey.get("title")
+    if isinstance(ref, str) and ref.strip():
+        return ref.strip()
+    return None
+
+
+def _collect_relationship_refs(
+    items: list[dict[str, Any]],
+    ref_builder: callable,
+    kind: str,
+) -> tuple[dict[str, int], list[str]]:
+    errors: list[str] = []
+    refs: dict[str, int] = {}
+    for index, item in enumerate(items, start=1):
+        ref = ref_builder(item)
+        if not ref:
+            errors.append(f"{kind}[{index}] must include a non-empty key or reference field")
+            continue
+        if ref in refs:
+            errors.append(f"{kind}[{index}] reference '{ref}' must be unique")
+            continue
+        refs[ref] = index
+    return refs, errors
+
+
+def _validate_relationships(
+    relationships: Any,
+    guideline_refs: set[str],
+    journey_refs: set[str],
+) -> list[str]:
+    errors: list[str] = []
+    if relationships is None:
+        return errors
+    if not isinstance(relationships, list):
+        return ["relationships must be a list of objects"]
+    if not relationships:
+        return ["relationships must be a non-empty list when provided"]
+
+    for index, relationship in enumerate(relationships, start=1):
+        if not isinstance(relationship, dict):
+            errors.append(f"relationships[{index}] must be an object")
+            continue
+        rel_type = _normalize_relationship_type(relationship.get("type"))
+        if rel_type not in RELATIONSHIP_TYPES:
+            errors.append(
+                f"relationships[{index}].type must be one of {', '.join(sorted(RELATIONSHIP_TYPES))}"
+            )
+        source = relationship.get("source")
+        if not isinstance(source, str) or not source.strip():
+            errors.append(f"relationships[{index}].source must be a non-empty string")
+        targets = relationship.get("targets")
+        if targets is None:
+            target = relationship.get("target")
+            targets = [target] if target is not None else []
+        if not isinstance(targets, list) or not targets or not all(
+            isinstance(target, str) and target.strip() for target in targets
+        ):
+            errors.append(f"relationships[{index}].targets must be a non-empty list of strings")
+
+        source_kind = relationship.get("source_kind", "guideline")
+        target_kind = relationship.get("target_kind", source_kind)
+        if source_kind not in RELATIONSHIP_KINDS:
+            errors.append(
+                f"relationships[{index}].source_kind must be guideline or journey when provided"
+            )
+        if target_kind not in RELATIONSHIP_KINDS:
+            errors.append(
+                f"relationships[{index}].target_kind must be guideline or journey when provided"
+            )
+
+        source_refs = guideline_refs if source_kind == "guideline" else journey_refs
+        target_refs = guideline_refs if target_kind == "guideline" else journey_refs
+        if isinstance(source, str) and source.strip() and source.strip() not in source_refs:
+            errors.append(
+                f"relationships[{index}].source '{source}' does not match any {source_kind} reference"
+            )
+        if isinstance(targets, list):
+            for target in targets:
+                if isinstance(target, str) and target.strip() and target.strip() not in target_refs:
+                    errors.append(
+                        f"relationships[{index}].target '{target}' does not match any {target_kind} reference"
+                    )
+            if rel_type != "DISAMBIGUATION" and len(targets) != 1:
+                errors.append(
+                    f"relationships[{index}].targets must contain exactly one target unless type is DISAMBIGUATION"
+                )
+            if rel_type == "DISAMBIGUATION" and len(targets) < 2:
+                errors.append(
+                    f"relationships[{index}].targets must contain at least two targets for DISAMBIGUATION"
+                )
+    return errors
+
+
 def _validate_spec(spec: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     missing = REQUIRED_SPEC_FIELDS - spec.keys()
@@ -135,6 +352,26 @@ def _validate_spec(spec: dict[str, Any]) -> list[str]:
 
     errors.extend(_validate_guidelines(spec.get("guidelines")))
     errors.extend(_validate_journeys(spec.get("journeys")))
+
+    guideline_refs, guideline_errors = _collect_relationship_refs(
+        spec.get("guidelines", []),
+        _relationship_ref_from_guideline,
+        "guidelines",
+    )
+    journey_refs, journey_errors = _collect_relationship_refs(
+        spec.get("journeys", []),
+        _relationship_ref_from_journey,
+        "journeys",
+    )
+    errors.extend(guideline_errors)
+    errors.extend(journey_errors)
+    errors.extend(
+        _validate_relationships(
+            spec.get("relationships"),
+            set(guideline_refs.keys()),
+            set(journey_refs.keys()),
+        )
+    )
 
     composition_mode = spec.get("composition_mode")
     if composition_mode is not None and composition_mode not in COMPOSITION_MODES:
@@ -261,6 +498,15 @@ async def create_parlant_bot(
                             "conditions": ["When customer asks about delivery"]
                         }
                     ],
+                    "relationships": [
+                        {
+                            "type": "priority",
+                            "source": "The customer is becoming upset",
+                            "targets": ["The customer wants a coke"],
+                            "source_kind": "guideline",
+                            "target_kind": "guideline",
+                        }
+                    ],
                     "composition_mode": "FLUID",
                     "max_engine_iterations": 3
                 })
@@ -300,6 +546,7 @@ async def create_parlant_bot(
     agent_tag = f"agent:{agent_id}"
 
     created_guidelines = []
+    guideline_id_by_ref: dict[str, str] = {}
     for idx, guideline in enumerate(spec["guidelines"], 1):
         guideline_payload = {
             "condition": guideline["condition"],
@@ -315,12 +562,17 @@ async def create_parlant_bot(
                 "id": guideline_response.get("id"),
                 "condition": guideline["condition"]
             })
+            guideline_ref = _relationship_ref_from_guideline(guideline)
+            guideline_id = guideline_response.get("id")
+            if guideline_ref and guideline_id:
+                guideline_id_by_ref[guideline_ref] = guideline_id
         else:
             created_guidelines.append({
                 "error": f"Guideline {idx} failed: {guideline_response.get('error')}"
             })
 
     created_journeys = []
+    journey_id_by_ref: dict[str, str] = {}
     for idx, journey in enumerate(spec["journeys"], 1):
         journey_payload = {
             "title": journey["title"],
@@ -337,43 +589,15 @@ async def create_parlant_bot(
                 "description": journey["description"],
                 "conditions": journey["conditions"],
             })
+            journey_ref = _relationship_ref_from_journey(journey)
+            journey_id = journey_response.get("id")
+            if journey_ref and journey_id:
+                journey_id_by_ref[journey_ref] = journey_id
         else:
             created_journeys.append({
                 "error": f"Journey {idx} failed: {journey_response.get('error')}"
             })
-
-    try:
-        persistence = get_persistence()
-        if persistence.enabled:
-            guidelines_for_persistence = []
-            for idx, guideline in enumerate(spec["guidelines"]):
-                if idx < len(created_guidelines) and "id" in created_guidelines[idx]:
-                    guidelines_for_persistence.append({
-                        "id": created_guidelines[idx]["id"],
-                        "condition": guideline["condition"],
-                        "action": guideline.get("action"),
-                        "description": guideline.get("description"),
-                        "criticality": _map_criticality_to_api(guideline.get("criticality")),
-                    })
-
-            persisted = await persist_bot_creation(
-                persistence=persistence,
-                agent_id=agent_id,
-                agent_name=agent_name,
-                agent_description=_build_agent_description(spec),
-                composition_mode=_map_composition_mode_to_api(spec.get("composition_mode")),
-                max_engine_iterations=spec.get("max_engine_iterations", 3),
-                guidelines=guidelines_for_persistence,
-                journeys=created_journeys,
-            )
-
-            if persisted:
-                print(f"💾 Persisted bot '{agent_name}' to MongoDB (ID: {agent_id})")
-            else:
-                print("⚠️  Bot created in Parlant but MongoDB persistence failed")
-    except Exception as e:
-        print(f"⚠️  MongoDB persistence error: {e}")
-
+    
     return p.ToolResult(
         {
             "status": "created",
@@ -381,8 +605,10 @@ async def create_parlant_bot(
             "agent_name": agent_name,
             "guidelines_created": len([g for g in created_guidelines if "id" in g]),
             "journeys_created": len([j for j in created_journeys if "id" in j]),
+            "relationships_created": len([r for r in created_relationships if "id" in r]),
             "guidelines": created_guidelines,
             "journeys": created_journeys,
+            "relationships": created_relationships,
             "api_base_url": PARLANT_API_BASE_URL,
             "persisted_to_mongodb": persistence.enabled if 'persistence' in locals() else False,
         }
@@ -404,36 +630,20 @@ async def main():
     print("🚀 Starting Otto Bot Creator Server...")
     print(f"📡 Parlant API: {PARLANT_API_BASE_URL}")
     print(f"⏱️  API Timeout: {PARLANT_API_TIMEOUT}s")
-
-    print("💾 Initializing domain persistence...")
-    persistence_enabled, persistence_message = await initialize_persistence(MONGODB_URI)
-
-    if persistence_enabled:
-        print(f"✅ {persistence_message}")
-        print("💾 Domain events will persist to MongoDB")
-        print("🔄 Bots will be rehydrated on startup")
-    else:
-        print(f"⚠️  {persistence_message}")
-        print("💾 Using in-memory only (no persistence)")
-        print("💡 Set MONGODB_URI in .env to enable persistence")
-
     print("-" * 50)
-    print("🏗️  Parlant: Using TransientDocumentDatabase (in-memory)")
-    print("📦 Persistence: Event-based MongoDB mirroring (domain layer)")
-    print("-" * 50)
-
-    try:
-        async with p.Server(nlp_service=p.NLPServices.openai) as server:
-            agent = await server.create_agent(
-                name="Otto",
-                description=(
-                    "Primary orchestrator for converting a business chatbot description into a fully "
-                    "configured Parlant bot. Collect requirements, detect gaps, ask focused follow-ups, "
-                    "produce a validated specification, and create the bot using Parlant REST APIs."
-                ),
-            )
-
-            print(f"✅ Created Otto agent (ID: {agent.id})")
+    
+    async with p.Server(nlp_service=p.NLPServices.openai) as server:
+        # Create Otto orchestrator agent
+        agent = await server.create_agent(
+            name="Otto",
+            description=(
+                "Primary orchestrator for converting a business chatbot description into a fully "
+                "configured Parlant bot. Collect requirements, detect gaps, ask focused follow-ups, "
+                "produce a validated specification, and create the bot using Parlant REST APIs."
+            ),
+        )
+        
+        print(f"✅ Created Otto agent (ID: {agent.id})")
 
             await agent.create_guideline(
                 condition="When a business user provides a bot description or asks to create a bot.",
@@ -465,17 +675,18 @@ async def main():
                 criticality=p.Criticality.MEDIUM,
             )
 
-            await agent.create_guideline(
-                condition="When all required parameters are explicit, validated, and confirmed by the user.",
-                action=(
-                    "Assemble a complete JSON bot specification with all required fields, validate it "
-                    "against the schema, and call create_parlant_bot to instantiate the bot via REST API. "
-                    "Provide the user with the created bot details including agent ID and confirmation."
-                ),
-                description="Only create bots from a fully validated specification using REST API.",
-                criticality=p.Criticality.HIGH,
-                tools=[create_parlant_bot],
-            )
+        # Guideline 4: Bot creation via REST API
+        await agent.create_guideline(
+            condition="When all required parameters are explicit, validated, and confirmed by the user.",
+            action=(
+                "Assemble a complete JSON bot specification with all required fields, validate it "
+                "against the schema, and call create_parlant_bot to instantiate the bot via REST API. "
+                "Provide the user with the created bot details including agent ID and confirmation."
+            ),
+            description="Only create bots from a fully validated specification using REST API.",
+            criticality=p.Criticality.HIGH,
+            tools=[create_parlant_bot],
+        )
 
             await agent.create_journey(
                 title="Bot Intake & Clarification",
