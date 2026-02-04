@@ -1,7 +1,7 @@
-# Otto Bot Creator Server - Dependencies
+# Otto Bot Creator Server - Production Dependencies
 
-# Parlant SDK for agent orchestration
-parlant>=3.1.2
+# Parlant SDK with MongoDB support
+parlant[mongo]>=3.1.2
 
 # HTTP client for REST API calls
 httpx>=0.28.0
@@ -11,5 +11,3 @@ python-dotenv>=1.0.0
 
 # OpenAI integration (required for NLP)
 openai>=1.0.0
-# Composio integration for external service tools
-composio>=0.11.0
