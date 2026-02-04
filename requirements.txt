@@ -11,3 +11,5 @@ python-dotenv>=1.0.0
 
 # OpenAI integration (required for NLP)
 openai>=1.0.0
+# Composio integration for external service tools
+composio>=0.11.0

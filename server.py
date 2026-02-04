@@ -3,8 +3,19 @@ import json
 import os
 import logging
 from typing import Any, Annotated
-
 import httpx
+
+# Import Composio tools from separate module
+from composio_tools import (
+    ALL_COMPOSIO_TOOLS,
+    connect_composio_account,
+    check_composio_connection,
+    execute_composio_tool,
+    list_composio_tools,
+    github_create_issue,
+    slack_send_message,
+    gmail_send_email,
+)
 import parlant.sdk as p
 from parlant.core.sessions import Event
 from dotenv import load_dotenv
@@ -751,6 +762,20 @@ async def main():
             description="Only create bots from a fully validated specification using REST API.",
             criticality=p.Criticality.HIGH,
             tools=[create_parlant_bot],
+        )
+
+        # Guideline 5: External service integrations via Composio
+        await agent.create_guideline(
+            condition="When the user wants to interact with external services like GitHub, Slack, Gmail, or other integrations.",
+            action=(
+                "Use Composio tools to perform the requested action. First check if the user "
+                "is authenticated with the required service using check_composio_connection. "
+                "If not connected, guide them through authentication using connect_composio_account. "
+                "Use list_composio_tools to discover available actions for a service."
+            ),
+            description="Enable external service integrations through Composio (500+ toolkits).",
+            criticality=p.Criticality.MEDIUM,
+            tools=ALL_COMPOSIO_TOOLS,
         )
 
         # Journey: Complete bot creation workflow
